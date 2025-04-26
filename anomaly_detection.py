@@ -7,10 +7,10 @@
 # The pipeline includes data analysis, preprocessing, Autoencoder (AE) training, evaluation with simulated ground truth, and visualization.
 #
 # **Dataset**: [UCI Air Quality Dataset](https://archive.ics.uci.edu/ml/datasets/Air+Quality)
-# **Tools**: Pandas, Scikit-learn, TensorFlow/Keras, Matplotlib, Seaborn, NumPy, Pickle
+# **Tools**: Pandas, Scikit-learn, TensorFlow/Keras, Matplotlib, Seaborn, NumPy, Pickle, Imblearn
 # **Outputs**:
 # - `preprocessed_data.csv`, `simulated_data.csv`, `anomaly_predictions_simulated.csv`
-# - `correlation_matrix.png`, `feature_distributions.png`, `diurnal_patterns.png`, `confusion_matrix_simulated.png`
+# - `correlation_matrix.png`, `feature_distributions.png`, `diurnal_patterns.png`, `confusion_matrix_simulated.png`, `mse_distribution.png`
 # - `ae.keras`, `scaler.pkl`
 
 # ## Import Libraries
@@ -20,9 +20,12 @@ import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.regularizers import l2
+from imblearn.over_sampling import SMOTE
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pickle
@@ -87,8 +90,9 @@ plt.savefig('diurnal_patterns.png')
 plt.close()
 
 # ## Data Preprocessing
-# Drop unnecessary columns
-df = df.drop(columns=['Unnamed: 15', 'Unnamed: 16', 'Hour'], errors='ignore')
+# Drop rows with NaN Date_Time
+df = df.dropna(subset=['Date_Time']).reset_index(drop=True)
+logger.info(f"Dropped {9357 - len(df)} rows with NaN Date_Time. New dataset size: {len(df)}")
 
 # Replace -200 with NaN and impute
 df[sensor_cols] = df[sensor_cols].replace(-200, np.nan)
@@ -100,19 +104,26 @@ df['NO2_rolling_mean'] = df['NO2(GT)'].rolling(window=3, min_periods=1).mean()
 df['C6H6_rolling_mean'] = df['C6H6(GT)'].rolling(window=3, min_periods=1).mean()
 df['NOx_lag1'] = df['NOx(GT)'].shift(1).bfill()
 
-# Add time-based features
-df['Day_of_Week'] = df['Date_Time'].dt.dayofweek
-df['Month'] = df['Date_Time'].dt.month
-df['Is_Weekend'] = df['Date_Time'].dt.dayofweek.isin([5, 6]).astype(int)
+# Add change-rate features
+df['CO_diff'] = df['CO(GT)'].diff().fillna(0)
+df['NO2_diff'] = df['NO2(GT)'].diff().fillna(0)
 
 # Define features for modeling
-feature_cols = ['CO(GT)', 'NO2(GT)', 'NOx(GT)', 'C6H6(GT)', 'CO_rolling_mean', 'NO2_rolling_mean', 'C6H6_rolling_mean', 'NOx_lag1']
+feature_cols = ['CO(GT)', 'NO2(GT)', 'NOx(GT)', 'C6H6(GT)', 'CO_rolling_mean',
+                'NO2_rolling_mean', 'C6H6_rolling_mean', 'NOx_lag1', 'CO_diff', 'NO2_diff']
 if not all(col in df.columns for col in feature_cols):
     raise ValueError("Missing feature columns in DataFrame")
+
+# Impute any remaining NaN in feature_cols
+df[feature_cols] = df[feature_cols].fillna(df[feature_cols].mean())
 
 # Normalize features
 scaler = StandardScaler()
 data_scaled = scaler.fit_transform(df[feature_cols])
+
+# Check for NaN in scaled data
+if np.any(np.isnan(data_scaled)):
+    raise ValueError("NaN values found in scaled data.")
 
 # Save preprocessed data
 df.to_csv('preprocessed_data.csv', index=False)
@@ -123,91 +134,44 @@ df_simulated = df.copy()
 anomaly_indices = np.random.choice(len(df), size=int(0.03 * len(df)), replace=False)
 for idx in anomaly_indices:
     r = np.random.random()
-    if r < 0.2:  # Combined CO/NO2 Spike
-        df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(7, 8)
-        df_simulated.loc[idx, 'NO2(GT)'] = np.random.uniform(210, 230)
-        df_simulated.loc[idx, 'NOx(GT)'] = np.random.uniform(550, 650)
-    elif r < 0.4:  # Rapid CO Change + Moderate NO2
-        df_simulated.loc[idx, 'NO2(GT)'] = np.random.uniform(140, 180)
-        df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(4, 6)
+    if r < 0.2:  # Combined CO/NO2/NOx Spike
+        df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(20, 25)
+        df_simulated.loc[idx, 'NO2(GT)'] = np.random.uniform(450, 500)
+        df_simulated.loc[idx, 'NOx(GT)'] = np.random.uniform(1200, 1400)
+    elif r < 0.4:  # Rapid CO/NO2 Change
+        df_simulated.loc[idx, 'NO2(GT)'] = np.random.uniform(350, 400)
+        df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(15, 18)
     elif r < 0.6:  # Sustained High CO/NO2
-        df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(7, 9)
-        df_simulated.loc[idx, 'NO2(GT)'] = np.random.uniform(190, 210)
-    elif r < 0.8:  # High Benzene + Normal CO
-        df_simulated.loc[idx, 'C6H6(GT)'] = np.random.uniform(28, 35)
-        df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(2, 4)
-    else:  # Nighttime Rapid CO Change
+        df_simulated.loc[idx:idx+2, 'CO(GT)'] = np.random.uniform(16, 20)
+        df_simulated.loc[idx:idx+2, 'NO2(GT)'] = np.random.uniform(400, 450)
+    elif r < 0.8:  # High Benzene + NOx
+        df_simulated.loc[idx, 'C6H6(GT)'] = np.random.uniform(80, 100)
+        df_simulated.loc[idx, 'NOx(GT)'] = np.random.uniform(800, 1000)
+    else:  # Nighttime CO/NO2 Spike
         if df_simulated.loc[idx, 'Date_Time'].hour in [0, 1, 2, 3, 22, 23]:
-            df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(3.5, 5)
+            df_simulated.loc[idx, 'CO(GT)'] = np.random.uniform(12, 15)
+            df_simulated.loc[idx, 'NO2(GT)'] = np.random.uniform(300, 350)
 
 # Compute derived features for simulated data
 df_simulated['CO_rolling_mean'] = df_simulated['CO(GT)'].rolling(window=3, min_periods=1).mean()
 df_simulated['NO2_rolling_mean'] = df_simulated['NO2(GT)'].rolling(window=3, min_periods=1).mean()
 df_simulated['C6H6_rolling_mean'] = df_simulated['C6H6(GT)'].rolling(window=3, min_periods=1).mean()
 df_simulated['NOx_lag1'] = df_simulated['NOx(GT)'].shift(1).bfill()
+df_simulated['CO_diff'] = df_simulated['CO(GT)'].diff().fillna(0)
+df_simulated['NO2_diff'] = df_simulated['NO2(GT)'].diff().fillna(0)
+
+# Impute any remaining NaN in feature_cols for simulated data
+df_simulated[feature_cols] = df_simulated[feature_cols].fillna(df_simulated[feature_cols].mean())
 
 # Normalize simulated data
 data_scaled_simulated = scaler.transform(df_simulated[feature_cols])
+
+# Check for NaN in scaled simulated data
+if np.any(np.isnan(data_scaled_simulated)):
+    raise ValueError("NaN values found in scaled simulated data.")
+
+# Save simulated data
 df_simulated.to_csv('simulated_data.csv', index=False)
-
-"""
-# Build AE for original data
-input_dim = len(feature_cols)
-latent_dim = 16
-inputs = Input(shape=(input_dim,))
-
-# Encoder
-h = Dense(32, activation='relu')(inputs)
-h = Dense(16, activation='relu')(h)
-h = Dense(8, activation='relu')(h)
-h = Dropout(0.2)(h)
-latent = Dense(latent_dim, activation='relu')(h)
-
-# Decoder
-decoder_h = Dense(8, activation='relu')(latent)
-decoder_h = Dense(16, activation='relu')(decoder_h)
-decoder_h = Dense(32, activation='relu')(decoder_h)
-decoder_h = Dropout(0.2)(decoder_h)
-outputs = Dense(input_dim, activation='linear')(decoder_h)
-
-# Define AE model
-ae = Model(inputs, outputs)
-ae.compile(optimizer='adam', loss='mse')
-
-# Split data into training and validation sets
-X_train, X_val, train_indices, val_indices = train_test_split(
-    data_scaled, np.arange(len(data_scaled)), test_size=0.2, random_state=42
-)
-logger.info("Data split into training and validation sets.")
-
-# Oversample anomalies for original data
-key_features = ['NOx(GT)', 'CO(GT)', 'NO2_rolling_mean']
-feature_indices = [feature_cols.index(feat) for feat in key_features]
-percentile_threshold = 97
-time_mask = df.iloc[train_indices]['Date_Time'].dt.hour.isin([0, 1, 2, 3, 22, 23]).values
-anomaly_mask = np.any([X_train[:, idx] > np.percentile(X_train[:, idx], percentile_threshold) for idx in feature_indices], axis=0) & time_mask
-normal_data = X_train[~anomaly_mask]
-anomaly_data = X_train[anomaly_mask]
-if len(anomaly_data) == 0:
-    anomaly_data = X_train[:int(0.03 * len(X_train))]
-oversampled_anomaly_data = np.repeat(anomaly_data, 3, axis=0)
-X_train_resampled = np.vstack([normal_data, oversampled_anomaly_data])
-np.random.shuffle(X_train_resampled)
-logger.info(f"Oversampling completed using heuristic method for original data. Anomalies selected: {len(anomaly_data)}")
-
-# Train AE on original data
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-logger.info("Starting AE training...")
-ae.fit(X_train_resampled, X_train_resampled, validation_data=(X_val, X_val),
-       epochs=200, batch_size=32, callbacks=[early_stopping], verbose=0)
-logger.info("AE training completed.")
-
-# Compute reconstruction errors with global thresholding for original data
-reconstructions = ae.predict(data_scaled, verbose=0)
-mse = np.mean(np.power(data_scaled - reconstructions, 2), axis=1)
-threshold = np.percentile(mse, 97)
-df['Anomaly'] = (mse > threshold).astype(int)
-"""
 
 # Split simulated data into training and validation sets
 X_train_sim, X_val_sim, sim_train_indices, sim_val_indices = train_test_split(
@@ -216,101 +180,99 @@ X_train_sim, X_val_sim, sim_train_indices, sim_val_indices = train_test_split(
 logger.info("Simulated data split into training and validation sets.")
 
 # Define AE for simulated data
-from tensorflow.keras.regularizers import l2
 input_dim = len(feature_cols)
-latent_dim = 16
+latent_dim = 32
+l2_reg = 0.005
 inputs = Input(shape=(input_dim,))
-h = Dense(32, activation='relu', kernel_regularizer=l2(0.03))(inputs)
-h = Dense(16, activation='relu', kernel_regularizer=l2(0.03))(h)
-h = Dense(8, activation='relu', kernel_regularizer=l2(0.03))(h)
+h = Dense(64, activation='relu', kernel_regularizer=l2(l2_reg))(inputs)
+h = Dense(32, activation='relu', kernel_regularizer=l2(l2_reg))(h)
+h = Dense(16, activation='relu', kernel_regularizer=l2(l2_reg))(h)
 h = Dropout(0.2)(h)
 latent = Dense(latent_dim, activation='relu')(h)
-decoder_h = Dense(8, activation='relu', kernel_regularizer=l2(0.03))(latent)
-decoder_h = Dense(16, activation='relu', kernel_regularizer=l2(0.03))(decoder_h)
-decoder_h = Dense(32, activation='relu', kernel_regularizer=l2(0.03))(decoder_h)
+decoder_h = Dense(16, activation='relu', kernel_regularizer=l2(l2_reg))(latent)
+decoder_h = Dense(32, activation='relu', kernel_regularizer=l2(l2_reg))(decoder_h)
+decoder_h = Dense(64, activation='relu', kernel_regularizer=l2(l2_reg))(decoder_h)
 decoder_h = Dropout(0.2)(decoder_h)
 outputs = Dense(input_dim, activation='linear')(decoder_h)
 ae_simulated = Model(inputs, outputs)
 ae_simulated.compile(optimizer='adam', loss='mse')
 logger.info("AE model for simulated data created.")
 
+# Identify normal and anomalous data for training
 key_features = ['NO2(GT)', 'C6H6(GT)']
 feature_indices = [feature_cols.index(feat) for feat in key_features]
-percentile_threshold = 96
-time_mask_sim = df_simulated.iloc[sim_train_indices]['Date_Time'].dt.hour.isin([0, 1, 2, 3, 22, 23]).values
-anomaly_mask_sim = np.any([X_train_sim[:, idx] > np.percentile(X_train_sim[:, idx], percentile_threshold) for idx in feature_indices], axis=0) & time_mask_sim
+percentile_threshold = 97
+anomaly_mask_sim = np.any([X_train_sim[:, idx] > np.percentile(X_train_sim[:, idx], percentile_threshold) for idx in feature_indices], axis=0)
 normal_sim_data = X_train_sim[~anomaly_mask_sim]
 anomaly_sim_data = X_train_sim[anomaly_mask_sim]
 if len(anomaly_sim_data) == 0:
     anomaly_sim_data = X_train_sim[:int(0.03 * len(X_train_sim))]
-oversampled_anomaly_sim_data = np.repeat(anomaly_sim_data, 3, axis=0)
-X_train_sim_resampled = np.vstack([normal_sim_data, oversampled_anomaly_sim_data])
-np.random.shuffle(X_train_sim_resampled)
-logger.info(f"Oversampling completed using heuristic method for simulated data. Anomalies selected: {len(anomaly_sim_data)}")
+logger.info(f"Normal data: {len(normal_sim_data)}, Anomalies selected: {len(anomaly_sim_data)}")
 
 # Define early stopping for simulated data
 early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-# Train AE on simulated data
-logger.info("Starting AE training for simulated data...")
-ae_simulated.fit(X_train_sim_resampled, X_train_sim_resampled, validation_data=(X_val_sim, X_val_sim),
+# Train AE on normal data only
+logger.info("Starting AE training for simulated data on normal data only...")
+ae_simulated.fit(normal_sim_data, normal_sim_data, validation_data=(X_val_sim, X_val_sim),
                  epochs=200, batch_size=32, callbacks=[early_stopping], verbose=0)
 logger.info("AE training for simulated data completed.")
 
-# Compute reconstruction errors with global thresholding for simulated data
+# Compute reconstruction errors with feature-weighted MSE and dynamic thresholding (FIXED)
 reconstructions_simulated = ae_simulated.predict(data_scaled_simulated, verbose=0)
 mse_simulated = np.mean(np.power(data_scaled_simulated - reconstructions_simulated, 2), axis=1)
-threshold_sim = np.percentile(mse_simulated, 95)
-df_simulated['Anomaly'] = (mse_simulated > threshold_sim).astype(int)
+# Feature-weighted MSE
+feature_contributions = np.abs(data_scaled_simulated - reconstructions_simulated).mean(axis=0)
+feature_importance = pd.Series(feature_contributions, index=feature_cols)
+weights = feature_importance / feature_importance.sum()
+weights[['CO_rolling_mean', 'NO2_rolling_mean', 'C6H6_rolling_mean']] *= 0.8  # Downweight rolling means
+# Convert weights to NumPy array and reshape for broadcasting
+weights_np = weights.to_numpy().reshape(1, -1)  # Shape: (1, 10)
+weighted_mse = np.mean(np.power(data_scaled_simulated - reconstructions_simulated, 2) * weights_np, axis=1)
+# Dynamic thresholding
+window_size = 100
+threshold_sim = np.percentile(weighted_mse, 96)  # Balanced threshold
+rolling_threshold = pd.Series(weighted_mse).rolling(window=window_size, min_periods=1).quantile(0.96).fillna(threshold_sim)
+df_simulated['Anomaly'] = (weighted_mse > rolling_threshold).astype(int)
+
+# Ensemble with Isolation Forest
+from sklearn.ensemble import IsolationForest
+iso_forest = IsolationForest(contamination=0.03, random_state=42)
+iso_predictions = iso_forest.fit_predict(data_scaled_simulated)
+iso_anomalies = (iso_predictions == -1).astype(int)
+df_simulated['Anomaly'] = df_simulated['Anomaly'] & iso_anomalies
+
+# Plot reconstruction error distribution
+plt.figure(figsize=(10, 6))
+sns.histplot(weighted_mse, bins=50, kde=True, label='Weighted MSE')
+plt.axvline(threshold_sim, color='r', linestyle='--', label='Base Threshold (96th)')
+plt.scatter(weighted_mse[anomaly_indices], np.zeros_like(weighted_mse[anomaly_indices]), color='red', label='True Anomalies', alpha=0.5)
+plt.title('Weighted Reconstruction Error Distribution with Dynamic Threshold')
+plt.xlabel('Weighted MSE')
+plt.legend()
+plt.savefig('mse_distribution_updated.png')
+plt.close()
 
 # Save predictions and model
-# df[['Date_Time'] + feature_cols + ['Anomaly']].to_csv('anomaly_predictions.csv', index=False)  # Commented out original data predictions
 df_simulated[['Date_Time'] + feature_cols + ['Anomaly']].to_csv('anomaly_predictions_simulated.csv', index=False)
 ae_simulated.save('ae.keras')
 with open('scaler.pkl', 'wb') as f:
     pickle.dump(scaler, f)
 
 # ## Evaluation
-"""
-# Refined domain-based ground truth
-co_threshold = np.percentile(df['CO_rolling_mean'].dropna(), 95)
-nox_threshold = np.percentile(df['NOx(GT)'].dropna(), 95)
-ground_truth_domain = (((df['CO_rolling_mean'] > co_threshold) |
-                       (df['NOx(GT)'] > nox_threshold)) &
-                      (df['Date_Time'].dt.hour.isin([0, 1, 2, 3, 22, 23]))).astype(int)
-print(f"Domain-Based Anomalies: {ground_truth_domain.sum()} ({ground_truth_domain.mean():.2%})")
-"""
-
 # Simulated ground truth
 ground_truth_simulated = np.zeros(len(df))
 ground_truth_simulated[anomaly_indices] = 1
 print(f"Simulated Anomalies: {ground_truth_simulated.sum()} ({ground_truth_simulated.mean():.2%})")
 
-"""
-# Evaluate domain-based metrics
-precision_domain = precision_score(ground_truth_domain, df['Anomaly'])
-recall_domain = recall_score(ground_truth_domain, df['Anomaly'])
-f1_domain = f1_score(ground_truth_domain, df['Anomaly'])
-print(f"\nDomain-Based - Precision: {precision_domain:.2f}, Recall: {recall_domain:.2f}, F1-Score: {f1_domain:.2f}")
-"""
-
 # Evaluate simulated metrics
-precision_simulated = precision_score(ground_truth_simulated, df_simulated['Anomaly'])
-recall_simulated = recall_score(ground_truth_simulated, df_simulated['Anomaly'])
-f1_simulated = f1_score(ground_truth_simulated, df_simulated['Anomaly'])
+precision_simulated = precision_score(ground_truth_simulated, df_simulated['Anomaly'], zero_division=0)
+recall_simulated = recall_score(ground_truth_simulated, df_simulated['Anomaly'], zero_division=0)
+f1_simulated = f1_score(ground_truth_simulated, df_simulated['Anomaly'], zero_division=0)
 print(f"Simulated - Precision: {precision_simulated:.2f}, Recall: {recall_simulated:.2f}, F1-Score: {f1_simulated:.2f}")
 
-"""
-# Save domain-based confusion matrix
-cm_domain = confusion_matrix(ground_truth_domain, df['Anomaly'])
-plt.figure(figsize=(6, 4))
-sns.heatmap(cm_domain, annot=True, fmt='d', cmap='Blues')
-plt.title('Confusion Matrix (Domain-Based)')
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.savefig('confusion_matrix_domain.png')
-plt.close()
-"""
+# Debug: Check predicted anomalies
+print(f"Predicted Anomalies: {df_simulated['Anomaly'].sum()} ({df_simulated['Anomaly'].mean():.2%})")
 
 # Save simulated confusion matrix
 cm_simulated = confusion_matrix(ground_truth_simulated, df_simulated['Anomaly'])
@@ -323,19 +285,22 @@ plt.savefig('confusion_matrix_simulated.png')
 plt.close()
 
 # Analyze feature importance for reconstruction errors
-feature_contributions = np.abs(data_scaled_simulated - reconstructions_simulated).mean(axis=0)
-feature_importance = pd.Series(feature_contributions, index=feature_cols)
 print("\nFeature Contributions to Reconstruction Errors (Simulated):")
 print(feature_importance.sort_values(ascending=False))
 
 # Plot reconstruction errors (simulated data)
 plt.figure(figsize=(12, 6))
-plt.plot(df_simulated['Date_Time'], mse_simulated, label='Reconstruction Error')
-plt.axhline(threshold_sim, color='r', linestyle='--', label='Threshold')
-plt.scatter(df_simulated[df_simulated['Anomaly'] == 1]['Date_Time'], mse_simulated[df_simulated['Anomaly'] == 1], color='red', label='Anomaly')
-plt.title('Reconstruction Errors and Anomalies (Simulated)')
+plt.plot(df_simulated['Date_Time'], weighted_mse, label='Weighted Reconstruction Error')
+plt.plot(df_simulated['Date_Time'], rolling_threshold, color='r', linestyle='--', label='Rolling Threshold')
+plt.scatter(df_simulated[df_simulated['Anomaly'] == 1]['Date_Time'], weighted_mse[df_simulated['Anomaly'] == 1], color='red', label='Anomaly')
+plt.title('Weighted Reconstruction Errors and Anomalies (Simulated)')
 plt.xlabel('Date_Time')
-plt.ylabel('MSE')
+plt.ylabel('Weighted MSE')
 plt.legend()
 plt.savefig('reconstruction_errors_simulated.png')
 plt.close()
+
+# Debug: Compare reconstruction errors for normal vs. anomalous data
+anomaly_mse = weighted_mse[anomaly_indices]
+normal_mse = weighted_mse[~np.isin(np.arange(len(weighted_mse)), anomaly_indices)]
+print(f"\nDebug - Mean Weighted MSE (Anomalies): {anomaly_mse.mean():.4f}, Mean Weighted MSE (Normal): {normal_mse.mean():.4f}")
