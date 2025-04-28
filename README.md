@@ -16,15 +16,9 @@ This project implements a real-time anomaly detection system for IoT sensor data
 
 ## Results
 - **Final Metrics** (Simulated Data):
-  - Precision: 0.47
-  - Recall: 0.73
-  - F1-Score: 0.57
-  - Predicted Anomalies: 435 (4.65%) vs. True Anomalies: 280 (2.99%)
-- **Cross-Validation Metrics** (5 folds):
-  - Average Precision: 
-  - 0.46 (±0.07)
-  - Average Recall: 0.68 (±0.09)
-  - Average F1-Score: 0.54 (±0.07)
+  - Precision: 0.68,
+  - Recall: 0.50, 
+  - F1-Score: 0.58
 - **Key Features**: `NO2_rolling_var`, `CO_diff`, `CO_rolling_var` are the top contributors to anomaly detection.
 
 ## Directory Structure
